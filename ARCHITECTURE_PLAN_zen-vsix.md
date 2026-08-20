@@ -2,27 +2,12 @@
 
 ## Summary
 
-`zen-vsix` is a single-binary Go CLI that takes **any supported store URL** and produces a VSIX compatible with a local VS Code fork: it resolves the URL to a downloadable `.vsix` (yt-dlp-style modular extractors), downloads it, and — only when the extension's `engines.vscode` requirement exceeds the fork's API version — rewrites the zip in a single streaming pass that recompresses **only** `extension/package.json` while byte-copying every other entry raw (no full extraction, no temp tree, O(manifest) memory). The fork's engine version is auto-detected from `product.json` (verified: Antigravity at `/media/jang/home/PortableApp/antigravity/resources/app/product.json` reports `1.107.0`), with a `force_engine_version` escape hatch. Built because extensions are released against newer VS Code engines than forks (Antigravity, Codex, Claude Desktop) ship, and the demonstrated `patch.sh` works but does a full unzip→edit→re-zip cycle (recompressing all 22 MB).
+`zen-vsix` is a single-binary Go CLI that takes **any supported store URL** (or a local `.vsix` path) and produces a VSIX compatible with a local VS Code fork: it resolves the URL to a downloadable `.vsix` via a **yt-dlp-style modular extractor registry**, downloads it, and — only when the extension's `engines.vscode` requirement exceeds the fork's API version — rewrites the zip in a single streaming pass that recompresses **only** `extension/package.json` while byte-copying every other entry raw (no full extraction, no temp tree, O(manifest) memory). The fork's engine version is auto-detected from `product.json` (verified: Antigravity at `/media/jang/home/PortableApp/antigravity/resources/app/product.json` reports `1.107.0`), with `force_engine_version`/`--engine-version` escape hatches. Built because extensions are released against newer engines than forks (Antigravity, Codex, Claude Desktop) ship; the demonstrated `patch.sh` works but does a full unzip→edit→re-zip cycle (recompressing all 22 MB). The architecture was red-teamed by an external browser.chat (claude) agent; its findings are dispositioned at the end, with two "blockers" independently verified false against the Go `archive/zip` source before folding.
 
 ## System boundaries
 
 ```
 zen-vsix <URL-or-local-vsix-path>  [--engine-version X] [-o out] [-k] [--no-patch] [-c config.json]
-```
-
-```
-┌──────────────────────────── zen-vsix binary ────────────────────────────┐
-│ main.go ──► internal/app/pipeline.go ──► Result (printed summary)      │
-│    │              │                                                      │
-│    │              ├─► internal/config  (config.json → Config)           │
-│    │              ├─► internal/detect (fork root → engine version)      │
-│    │              ├─► internal/extract (registry → extractor → Artifact)│
-│    │              ├─► internal/download (Artifact.URL → .vsix file)     │
-│    │              └─► internal/vsix (manifest read + zip patch + verify)│
-└──────────────────────────────────────────────────────────────────────────┘
-        │                    │                  │                   │
-   config.json          fork tree          store APIs            out/ dir
-   (project root)   (vscode_path)    MS Marketplace │ Open VSX   (portable)
 ```
 
 ```mermaid
@@ -33,7 +18,7 @@ flowchart LR
     M --> P[internal/app/pipeline]
     CFG --> P
     DET --> P
-    P --> REG[internal/extract registry]
+    P --> REG[internal/extract registry: ordered slice]
     REG --> MS[Marketplace extractor]
     REG --> OV[Open VSX extractor]
     REG --> DR[Direct extractor]
@@ -44,6 +29,7 @@ flowchart LR
     DL --> TMP[out/.tmp-*.vsix]
     P --> VSIX[internal/vsix patcher]
     VSIX --> OUT[out/&lt;pub&gt;.&lt;name&gt;-&lt;ver&gt;-patched.vsix]
+    LOCK[(out/.lock flock\ncritical section)] -.serializes.-> P
 ```
 
 ## Data flow and state management
@@ -58,103 +44,118 @@ sequenceDiagram
     participant V as vsix patcher
     U->>M: zen-vsix <URL>
     M->>P: Run(ctx, URL, Options)
-    P->>P: load config.json; resolve engine target<br/>(force_engine_version > CLI flag > detect fork)
+    P->>P: load config.json; lock out/.lock (flock)
+    P->>P: resolve engine target<br/>(CLI --engine-version > config force_engine_version > detect fork)
     P->>E: extract.ForURL(URL) → Extract(ctx, URL)
-    E-->>P: Artifact{publisher, name, version, directURL, localPath?}
+    E-->>P: Artifact{publisher?, name?, version?, directURL?, localPath?}
     alt remote artifact
-        P->>D: Download(directURL, out/.tmp-<rand>.vsix)
+        P->>D: Download(directURL, out/.tmp-<rand>.vsix)  [429 retry/backoff]
     else local .vsix path
-        P->>P: input file is already the vsix
+        P->>P: input file is the vsix
     end
     P->>V: ReadManifest(vsix) → engines.vscode
     alt constraint NOT satisfied by fork version
         P->>V: PatchVSIX(src, out/&lt;pub&gt;.&lt;name&gt;-&lt;ver&gt;-patched.vsix)
-        P->>V: VerifyPatched(out, wantEngine)
-    else satisfied or --no-patch
+        P->>V: VerifyPatched(out, wantEngine)  [+ external unzip -t]
+    else satisfied, unparseable-constraint, or --no-patch
         P->>P: keep original; no rewrite (rename if remote)
     end
+    P->>P: release lock
     P-->>M: Result{patched?, engines before/after, bytes}
     M-->>U: human-readable summary
 ```
 
-**State management:** deliberately stateless. No cache, no DB, no lock files — each invocation resolves "latest" fresh, downloads to a temp file, and atomically renames into place. The only persistent artifacts are `config.json` (user-owned) and files in `out/`. Deterministic for a given URL + fork version.
+**State management:** deliberately stateless and idempotent. No cache, no DB. Each invocation resolves "latest" fresh, downloads to a unique temp file, and atomically renames into place. A single advisory `flock` on `out/.lock` serializes the patch→rename critical section so concurrent runs don't produce torn state or a TOCTOU collision. The only persistent artifacts are `config.json` (user-owned) and files in `out/`.
 
 ## Implementation Blueprint
 
-All paths relative to project root `/media/jang/home/Deve/zen-vsix/`. Module name: `zen-vsix`, `go 1.23`, single external dep: `github.com/Masterminds/semver/v3` (constraint *evaluation* — `golang.org/x/mod/semver` can only canonicalize, not check `^1.85.0 || ^1.86.0`-style constraints).
+Module `zen-vsix`, `go 1.23`, single external dep `github.com/Masterminds/semver/v3` (constraint *evaluation*, incl. `||` unions — `golang.org/x/mod/semver` only canonicalizes).
 
 ### Ordered build steps
 
 | # | File path | Action | Concrete signature / schema | Depends on | Acceptance criteria ("done when") |
 |---|-----------|--------|------------------------------|------------|-----------------------------------|
-| 1 | `go.mod` | create | `module zen-vsix`, `go 1.23`, require `github.com/Masterminds/semver/v3 v3.x` | — | `go build ./...` and `go vet ./...` pass on a stub tree |
-| 2 | `internal/config/config.go` | create | `type Config struct { VSIXPath string \`json:"vscode_path"\`; OutputDir string \`json:"output_dir"\`; ForceEngineVersion string \`json:"force_engine_version"\`; PatchManifest bool \`json:"patch_manifest"\`; Overwrite bool \`json:"overwrite"\` }`; `func Default() *Config`; `func Load(path string) (*Config, error)` (missing file → `Default`, invalid JSON → error); `func (c *Config) ResolveOutputDir() (string, error)` — **resolves relative to config.json's directory, not CWD** (portability requirement) | 1 | Unit tests: defaults; relative `output_dir` resolves against config dir; malformed JSON returns error |
-| 3 | `internal/detect/version.go` | create | `func DetectEngineVersion(appRoot string) (string, error)` — probes in order: `<root>/resources/app/product.json`, `<root>/resources/app/package.json`, `<root>/product.json`, `<root>/package.json`; reads `version`, canonicalizes via semver (strips `v`/pre-release kept), returns `"1.107.0"`; `var ErrNoProduct = errors.New(...)` when nothing found | 2 | Unit test with temp fixture tree: Antigravity layout → `"1.107.0"`; empty dir → `ErrNoProduct` |
-| 4 | `internal/extract/extractor.go` | create | `type Artifact struct { Publisher, Name, Version string; DirectURL string; LocalPath string; Source string }`; `type Extractor interface { Name() string; Priority() int; Pattern() *regexp.Regexp; Extract(ctx context.Context, rawURL string) (*Artifact, error) }`; `var ErrNoExtractor = errors.New("no extractor supports this URL")` | 1 | Compiles; interface documented as the sole extension point (yt-dlp `_VALID_URL` equivalent) |
-| 5 | `internal/extract/registry.go` | create | `func Register(e Extractor)`; `func ForURL(rawURL string) (Extractor, bool)` — sorts registered extractors by `Priority()` desc, returns first whose `Pattern().MatchString(rawURL)` is true | 4 | Unit test: `https://open-vsx.org/...` and `https://marketplace.visualstudio.com/...` resolve to their extractors even though `direct.go` alphabetically precedes them (priority sort, not init order) |
-| 6 | `internal/extract/direct.go` | create | Priority 0. Patterns: `^(https?://.+)\.vsix([?#].*)?$` → `Artifact{DirectURL: url}`; `^file://(.+\.vsix)$` and bare fs paths ending `.vsix` (via `os.Stat`) → `Artifact{LocalPath: path, Version: parsed-from-manifest-later}` | 5 | Unit test: http `.vsix` URL → DirectURL set; local `.vsix` path → LocalPath set; `foo.txt` → no match |
-| 7 | `internal/extract/openvsx.go` | create | Priority 90. Patterns: `^https://open-vsx\.org/(?:extension\|api)/([^/]+)/([^/]+)(?:/([^/]+))?` (version optional). `Extract`: GET `https://open-vsx.org/api/{pub}/{name}` (or `/{ver}`), decode `{version string, files struct{download string}}`, return `Artifact{Publisher, Name, Version, DirectURL: files.download}` | 5 | Unit test against `httptest` mock: item URL → correct artifact; version-specific URL honored; 404 → error |
-| 8 | `internal/extract/marketplace.go` | create | Priority 100. Patterns: `^https://marketplace\.visualstudio\.com/items\?itemName=([^.]+)\.([^&]+)` (item page) and `^https://marketplace\.visualstudio\.com/_apis/public/gallery/publishers/([^/]+)/vsextensions/([^/]+)/([^/]+)/vspackage` (direct API form). `Extract` for item page: `POST https://marketplace.visualstudio.com/_apis/public/gallery/extensionquery` with JSON filter `{filterType:7, value:"pub.name"}` and `flags: 914`, take `results[0].extensions[0].versions[0]` (latest), pick `files[]` entry with `assetType=="Microsoft.VisualStudio.Services.VSIXPackage"` (prefer `targetPlatform=="universal"` or empty) → `Artifact{Publisher, Name, Version, DirectURL: file.source}`. API-form URL → no query, `DirectURL = rawURL` | 5 | Unit test against `httptest` mock gallery: item URL → version + direct URL; API URL passthrough; no auth header sent |
-| 9 | `internal/vsix/manifest.go` | create | `type Manifest struct { Name string \`json:"name"\`; Publisher string \`json:"publisher"\`; Version string \`json:"version"\`; Engines map[string]string \`json:"engines"\` }`; `func ReadManifest(r io.ReaderAt, size int64) (*Manifest, error)` — locates `extension/package.json` in zip, streams it (cap 10 MB), JSON-decodes; missing entry → error | 1 | Unit test with in-memory generated vsix fixture (zip + package.json): correct parse; entry missing → error |
-| 10 | `internal/vsix/patcher.go` | create | `type PatchOptions struct { EngineVersion string; PatchManifest bool }`; `type PatchResult struct { OriginalEngine string; PatchedEngine string; Patched bool; EntriesTotal, EntriesPatched int; BytesWritten int64 }`; `func NeedsPatch(constraint, targetVersion string) (bool, error)` — `semver.NewConstraint` + `Check`; empty constraint → `(false, nil)`; `func PatchVSIX(ctx context.Context, src, dst string, opts PatchOptions) (*PatchResult, error)` — `zip.OpenReader(src)`, `zip.Create(dst)`, iterate entries in order: for `extension/package.json` decompress→modify `engines.vscode = "^"+EngineVersion`→recompress (Deflate); for `extension.vsixmanifest` if `opts.PatchManifest` replace `Microsoft.VisualStudio.Code.Engine` value; all other entries `OpenRaw()`→`CreateRaw()`→`io.Copy` (zero recompression); CRCs/sizes carried in copied `FileHeader`; `zip64` handled transparently by archive/zip | 9 | Unit tests: (a) target 1.107.0 on `^1.109.0` fixture → `Patched=true`, `PatchedEngine=="^1.107.0"`, (b) every non-manifest entry byte-identical to source after repack, (c) `^1.90.0` + target 1.107.0 → `Patched=false`, (d) output reopens cleanly with `zip.OpenReader`, (e) fixture with data-descriptor entries (streaming-written zip) survives |
-| 11 | `internal/vsix/verify.go` | create | `func VerifyPatched(vsixPath, wantEngine string) error` — reopen, `ReadManifest`, assert `Engines["vscode"] == "^"+wantEngine`, else error | 10 | Unit test: tampered vsix → error; good vsix → nil |
-| 12 | `internal/download/downloader.go` | create | `func Download(ctx context.Context, url, dest string) (int64, error)` — GET, follow redirects (cap 10), stream to `dest` (O(1) memory), on error remove partial `dest`; `var ErrTooManyRedirects`, `var ErrBadStatus` (non-2xx with body snippet) | 1 | Unit test with `httptest`: 302 chain works; 404 → `ErrBadStatus`; partial file removed on mid-stream error |
-| 13 | `internal/app/pipeline.go` | create | `type Options struct { ConfigPath string; EngineOverride string; OutputDirOverride string; KeepOriginal bool; NoPatch bool }`; `type Result struct { Artifact *extract.Artifact; OriginalVSIX, PatchedVSIX string; Patched bool; OriginalEngine, PatchedEngine string; BytesWritten int64 }`; `func Run(ctx context.Context, rawURL string, opts Options) (*Result, error)` — orchestrates: config → engine target (`EngineOverride` > config `ForceEngineVersion` > `DetectEngineVersion(config.VSIXPath)`; error if none available) → `extract.ForURL` → download to `out/.tmp-*.vsix` (or use LocalPath) → `ReadManifest` → `NeedsPatch` → `PatchVSIX` → `VerifyPatched` → rename/cleanup (atomic; `Overwrite=false` → fail if dst exists; `KeepOriginal` keeps temp as `out/<pub>.<name>-<ver>.vsix`) | 2,3,6,7,8,10,11,12 | End-to-end test: httptest marketplace + temp fork tree → patched vsix in `out/` with `^1.107.0`; local `.vsix` path → `-patched` sibling (patch.sh parity); satisfied-constraint case → untouched file, `Patched=false` |
-| 14 | `main.go` | create | `func main()` — flags `-c <config>`, `--engine-version`, `-o <dir>`, `-k/--keep-original`, `--no-patch`, `-h`; single positional arg (URL or local vsix path); calls `app.Run`; exit 0 on success, 1 with message on error | 13 | Manual: `zen-vsix https://marketplace.visualstudio.com/items?itemName=cdervis.vscode-pi` against real fork tree; `zen-vsix /path/to/x.vsix`; unknown URL → `ErrNoExtractor` message listing supported forms |
-| 15 | `config.json` | create | `{"vscode_path": "/media/jang/home/PortableApp/antigravity/", "output_dir": "out", "force_engine_version": "", "patch_manifest": false, "overwrite": true}` | 2 | `zen-vsix` loads it with no errors |
-| 16 | `.gitignore`, `README.md` | create | ignore `out/` and `*.vsix`; README: install, `zen-vsix URL`, config reference, "patching ≠ API compatibility guarantee" warning | 14 | README documents every flag and the extractor-adding recipe (copy one extractor file, register in `init()`) |
+| 1 | `go.mod` | create | `module zen-vsix`, `go 1.23`, require `github.com/Masterminds/semver/v3 v3.x` | — | `go build ./...`, `go vet ./...` pass on stub tree |
+| 2 | `internal/config/config.go` | create | `type Config struct { VSIXPath string \`json:"vscode_path"\`; OutputDir string \`json:"output_dir"\`; ForceEngineVersion string \`json:"force_engine_version"\`; Overwrite bool \`json:"overwrite"\` }`; `func Default() *Config`; `func Load(path string) (*Config, error)` (missing file→`Default`, invalid JSON→error); `func (c \*Config) ResolveOutputDir() (string, error)` — resolves relative to **config.json's dir**, not CWD | 1 | Unit: defaults; relative `output_dir`→config-dir; malformed JSON→error |
+| 3 | `internal/detect/version.go` | create | `func DetectEngineVersion(appRoot string) (string, error)`; probes `<root>/resources/app/product.json`, `.../package.json`, `<root>/product.json`, `<root>/package.json`; **distinct errors**: `ErrNoProduct` (no candidate file found at any path) vs returned semver parse error (**file found but `version` empty/garbage**); returns canonical `"1.107.0"` (pre-release retained) | 2 | Unit: Antigravity layout→`1.107.0`; empty dir→`ErrNoProduct`; `version:""`→parse error (not ErrNoProduct) |
+| 4 | `internal/extract/extractor.go` | create | `type Artifact struct { Publisher, Name, Version string; DirectURL, LocalPath string; Source string }` (Publisher/Name/Version may be empty, backfilled later); `type Extractor interface { Name() string; Pattern() *regexp.Regexp; Extract(ctx context.Context, rawURL string) (\*Artifact, error) }`; `var ErrNoExtractor = errors.New(...)` | 1 | Compiles; interface documented as the sole extension point (yt-dlp `_VALID_URL` equivalent) |
+| 5 | `internal/extract/registry.go` | create | `var all = []Extractor{&marketplaceExtractor{}, &openVSXExtractor{}, &directExtractor{}}` — **explicit ordered slice** (first match wins). `func ForURL(rawURL string) (Extractor, bool)` iterates in order. No per-file `init()` registration, no priority numbers | 4 | Unit: marketplace/openvsx URLs resolve before direct despite source-file order; unknown URL→`(nil,false)`; adding a store = one append to `all` |
+| 6 | `internal/extract/direct.go` | create | no priority. `^(https?://.+)\.vsix([?#].*)?$` → `Artifact{DirectURL: url}`; `^file://(.+\.vsix)$` and bare fs path ending `.vsix` (`os.Stat`) → `Artifact{LocalPath: path}`. Version/Name/Publisher intentionally empty (backfilled by pipeline from manifest) | 5 | Unit: http `.vsix`→DirectURL; local path→LocalPath; `foo.txt`→no match |
+| 7 | `internal/extract/openvsx.go` | create | `^https://open-vsx\.org/(?:extension\|api)/([^/]+)/([^/]+)(?:/([^/]+))?` (version opt). `Extract`: `GET https://open-vsx.org/api/{pub}/{name}(/{ver})`, decode `{version string, files struct{download string}}` → `Artifact{Publisher, Name, Version, DirectURL: files.download}` | 5 | Unit (`httptest`): item URL→correct; version-specific honored; 404→error |
+| 8 | `internal/extract/marketplace.go` | create | Patterns: item page `^https://marketplace\.visualstudio\.com/items\?itemName=([^.]+)\.([^&]+)`; direct API `^.../_apis/public/gallery/publishers/([^/]+)/vsextensions/([^/]+)/([^/]+)/vspackage`. Item page: `POST https://.../extensionquery`, filter `{filterType:7,value:"pub.name"}`, `flags:914`, take `results[0].extensions[0].versions[0]` (latest), pick VSIXPackage `file.source` (prefer `targetPlatform=="universal"`/empty). **Empty `extensions[]`/`versions[]` → `ErrNotFound`, not panic.** API-form→`DirectURL=rawURL`. Sends `User-Agent: zen-vsix/0.1` | 5 | Unit (`httptest`): item→artifact; API passthrough; empty result→`ErrNotFound`; no auth header |
+| 9 | `internal/vsix/manifest.go` | create | `type Manifest struct { Name string \`json:"name"\`; Publisher string \`json:"publisher"\`; Version string \`json:"version"\`; Engines map[string]string \`json:"engines"\` }`; `func ReadManifest(r io.ReaderAt, size int64) (*Manifest, error)` — locate `extension/package.json` (**case-insensitive fallback** on entry name; on miss, error lists near-miss entry names), stream with 10 MB cap, JSON-decode; **multi-disk zip → clear "unsupported" error, not raw parse error** | 1 | Unit: parse ok; entry missing→error naming near-misses; `Extension/package.json` (case variant) found |
+| 10 | `internal/vsix/patcher.go` | create | `type PatchOptions struct { EngineVersion string }`; `type PatchResult struct { OriginalEngine, PatchedEngine string; Patched bool; EntriesTotal, EntriesPatched int; BytesWritten int64 }`; `func NeedsPatch(constraint, targetVersion string) (bool, error)` — **strip prerelease from `targetVersion` then** `semver.NewConstraint`+`Check` (fork "insider" tags don't reflect engine API; Masterminds `Check` excludes prerelease otherwise → wrong decisions); empty/**whitespace-only** constraint→`(false,nil)`; **unparseable constraint→`(false, nil)`, caller warns + skips patch** (non-destructive default). `func PatchVSIX(ctx,* src,dst string, opts PatchOptions) (*PatchResult, error)` — `zip.OpenReader(src)`, `zip.Create(dst)`, iterate in order; `extension/package.json` decompress→set `engines.vscode="^"+EngineVersion`→recompress (Deflate); all other entries **raw copy**: `fh := *srcFile.FileHeader` (value copy — CreateRaw mutates), `CreateRaw(&fh)`, `OpenRaw()`, `io.Copy`. **Verified against archive/zip source:** bit-3 descriptor is emitted by `fileWriter.close()` in raw mode from CD sizes/CRC; zip64 branches on `CompressedSize64`; reader stores raw name bytes (no EFS transcode). Non-goal (documented comment): `Extra` fields on the recompressed package.json entry are dropped | 9 | **Tests (a–g)**: (a) `^1.109.0`+target `1.107.0`→`Patched=true`, `^1.107.0`; (b) every non-manifest entry byte-identical to source; (c) `^1.90.0`+`1.107.0`→`Patched=false`; (d) `1.107.0-insider`+`^1.85.0`→`Patched=false` (**prerelease normalized**); (e) `1.90.x`, `>=1.85.0 <1.100.0`, `^1.85.0 \|\| ^1.86.0`, whitespace-only → correct; (f) streaming-written (data-descriptor) fixture survives; (g) **synthetic zip64 fixture** survives; **plus: output passes `unzip -t` (independent parser)** |
+| 11 | `internal/vsix/verify.go` | create | `func VerifyPatched(vsixPath, wantEngine string) error` — reopen, `ReadManifest`, assert `Engines["vscode"]=="^"+wantEngine`. Also `func VerifyWithExternal(vsixPath string) error` wrapping system `unzip -t` | 10 | Unit: tampered→error; good→nil; external-unzip invocation succeeds on real fixture |
+| 12 | `internal/download/downloader.go` | create | `func Download(ctx context.Context, url, dest string) (int64, error)` — GET, redirect cap 10, stream to `dest` (O(1) memory); **on HTTP 429 honor `Retry-After`, retry up to 2× with backoff**; on error remove partial `dest`; `var ErrTooManyRedirects`, `var ErrBadStatus` | 1 | Unit (`httptest`): 302 chain ok; 404→`ErrBadStatus`; 429→retry→success and retry→exhaust->error; partial removed on mid-stream error |
+| 13 | `internal/app/pipeline.go` | create | `type Options struct { ConfigPath string; EngineOverride string; OutputDirOverride string; KeepOriginal bool; NoPatch bool }`; `type Result struct { Artifact \*extract.Artifact; OriginalVSIX, PatchedVSIX string; Patched bool; OriginalEngine, PatchedEngine string; BytesWritten int64 }`; `func Run(ctx context.Context, rawURL string, opts Options) (\*Result, error)` — **precedence: `-o` flags win over config `output_dir`; engine `--engine-version` > config `ForceEngineVersion` > detect (error if none available and patch needed)**; acquire `flock` on `ResolveOutputDir()/`..`.lock` for the rewrite+rename critical section (release via defer); download→temp (or LocalPath); `ReadManifest`; **backfill empty `Artifact.Publisher/Name/Version` from Manifest**; `NeedsPatch`; if patch needed→`PatchVSIX`→`VerifyPatched` (+`VerifyWithExternal`); rename final (atomic; `Overwrite=false`→fail if dst exists, checked under lock); `KeepOriginal` keeps temp as `out/<base>.vsix` (**no-op when input was local**); **`--no-patch`** = download only + report "satisfied/skipped", never rewrite; wrap target dir creation, return named error on permission failure | 2,3,5,6,7,8,10,11,12 | E2E: httptest marketplace + temp fork tree→patched in `out/` with `^1.107.0`; local `.vsix`→`-patched` sibling (patch.sh parity); satisfied→untouched, `Patched=false`; `--engine-version` override honored; concurrent `Run` on same dst doesn't corrupt |
+| 14 | `main.go` | create | `func main()` — flags `-c/-config`, `--engine-version`, `-o`, `-k/--keep-original`, `--no-patch`, `-h`; single positional arg (URL or local vsix path); **wraps ctx with 60 s timeout**; exit 0 success/1 error with message; `ErrNoExtractor` lists supported URL forms | 13 | Manual: `zen-vsix https://marketplace.visualstudio.com/items?itemName=cdervis.vscode-pi` against real fork tree; `zen-vsix /path/to/x.vsix`; unknown URL→`ErrNoExtractor` |
+| 15 | `config.json` | create | `{"vscode_path": "/media/jang/home/PortableApp/antigravity/", "output_dir": "out", "force_engine_version": "", "overwrite": true}` | 2 | `zen-vsix` loads it, no errors |
+| 16 | `.gitignore`, `README.md` | create | ignore `out/` and `*.vsix`; README: install, `zen-vsix URL`, config reference, extractor-adding recipe (append one file + one entry in `registry.go` `all`), "patching ≠ API compatibility" warning | 14 | README documents every flag + extension recipe |
 
-### yt-dlp-style extensibility contract (the maintenance story)
+### yt-dlp-style extensibility contract
 
-- **Adding a source = one new file** `internal/extract/<source>.go` containing a struct implementing `Extractor`, a `Pattern()` regex, a `Priority()` (highest wins on overlap), and an `init()` that calls `extract.Register(&X{})`. Nothing else changes — `ForURL`, the pipeline, and the CLI are source-agnostic.
-- Priority policy: generic/direct = 0, domain-specific extractors = 50–100, so future GitHub-release or JetBrains-style extractors slot in without touching existing files.
+Adding a store = one new file `internal/extract/<source>.go` (a struct implementing `Extractor` with a `Pattern()` regex + `Extract()`) plus **one append** to the `all` slice in `registry.go`. Nothing else changes. The ordered-slice design (vs. earlier `init()`-registered priorities) removes magic-number priority bands and init-order fragility — first match in `all` wins. The pipeline and CLI are source-agnostic.
 
 ## Failure modes and mitigations
 
 | Failure mode | Guard (file/function) |
 |---|---|
-| URL matches no extractor | `extract/registry.go:ForURL` returns `ErrNoExtractor`; `main.go` prints supported patterns; exit 1 |
-| Marketplace API down / rate-limited / non-2xx | `download/downloader.go:Download` → `ErrBadStatus` with response snippet; extractor errors propagate with `Source` name in message |
-| Extension has no `engines.vscode` | `vsix/patcher.go:NeedsPatch` returns `(false, nil)`; pipeline keeps file, reports "no constraint" |
-| Fork version detection fails (bad `vscode_path`) | `detect/version.go` returns `ErrNoProduct` naming the probed paths; pipeline suggests `force_engine_version` |
-| Malformed semver in product.json or constraint | `NeedsPatch`/`DetectEngineVersion` return typed errors; never a silent wrong patch |
-| Corrupt/partial download | temp-file + `os.Rename` pattern in `pipeline.go`; `Download` removes partials on error; `VerifyPatched` catches structural damage before rename |
-| Patched zip structurally invalid | `vsix/verify.go:VerifyPatched` reopens and re-reads manifest post-patch; failure → exit 1, temp not renamed |
-| Entry missing from vsix (badly-built extension) | `vsix/manifest.go:ReadManifest` errors on absent `extension/package.json` |
-| Pathological zip (huge manifest) | `ReadManifest` caps entry read at 10 MB |
-| Output collision | `config.Overwrite=false` → `pipeline.go` fails with clear message instead of clobbering |
-| Raw-copy breaks on data-descriptor entries | patcher always copies `FileHeader` from central directory (sizes/CRC authoritative there); acceptance test (e) proves it |
-| Patch makes extension *install* but break *at runtime* (API not actually present in fork) | documented limitation; README warning; user's stated purpose ("patching is required to even use them") accepts this risk |
+| URL matches no extractor | `extract/registry.go:ForURL`→`ErrNoExtractor`; `main.go` lists supported forms; exit 1 |
+| Marketplace/OpenVSX API down / 404 / 429 | `download/downloader.go` (`ErrBadStatus`) + 429 retry/backoff; extractor errors carry `Source` name |
+| Marketplace item not found (empty result) | `extract/marketplace.go`→`ErrNotFound` (avoids index-out-of-range panic) |
+| Extension has no/empty/whitespace `engines.vscode` | `vsix/patcher.go:NeedsPatch`→`(false,nil)`, pipeline keeps file, reports "no constraint" |
+| Constraint unparseable | `NeedsPatch`→`(false,nil)` + caller logs warning + **keeps original** (non-destructive) |
+| Fork version detection fails | `detect/version.go` `ErrNoProduct` (no file) vs parse error (empty/garbage version) both named; pipeline suggests `force_engine_version` |
+| Fork version has prerelease suffix (`1.107.0-insider`) | `NeedsPatch` strips prerelease before `Check` — correct patch decision (step 10) |
+| Corrupt/partial download | temp + atomic `os.Rename`; `Download` removes partials on error; `VerifyPatched` guards before rename |
+| Patched zip structurally invalid | `vsix/verify.go` reopen + manifest re-read + **external `unzip -t`**; failure→exit 1, temp untouched |
+| Raw-copy zip edge cases (descriptor/zip64/name bytes) | **verified against Go source**; fixtures (f/g) + `unzip -t` regression net in step 10 |
+| `Extension/package.json` missing or case-variant | `vsix/manifest.go` case-insensitive fallback + near-miss error listing |
+| Multi-disk / pathological zip | `ReadManifest` clear "unsupported" error; 10 MB manifest cap |
+| Output dir missing / no write permission | `pipeline.go` creates dir + named permission error message |
+| Output collision / concurrent runs | `flock` on `out/.lock` around rewrite+rename; `Overwrite=false`→checked fail under lock |
+| Patch installs but breaks at runtime (API absent in fork) | documented limitation; README warning; user's stated goal accepts it |
 
 ## Key decisions and alternatives considered
 
-1. **Streaming raw-copy zip rewrite (chosen)** vs full unzip/rezip (demonstrated `patch.sh`: recompresses everything, temp dir, ~3× disk IO) vs byte-level in-place zip surgery (rejected: `extension/package.json` is Deflate-compressed — verified 89% compression — so a same-size byte patch is impossible without recompression, which shifts offsets and invalidates the central directory). Raw copy costs 1 read + 1 write pass with near-zero CPU.
-2. **Auto-detect exact fork version → `^1.107.0` (chosen)** vs conservative floor like the example's `^1.100.0` (rejected: fork `product.json` provably reports `1.107.0`; the floor was a hand-picked constant, and a lower-than-real engine can mask genuinely-missing APIs). `force_engine_version` config + `--engine-version` flag remain as the escape hatch. *(Q1 — adopted per recommendation; user did not object.)*
-3. **Patch `package.json` only by default (chosen)** vs also rewriting `extension.vsixmanifest`'s `Microsoft.VisualStudio.Code.Engine` (deferred: the demonstrated working patch.sh doesn't touch it; some forks may validate the manifest, so `patch_manifest: true` exists for them). *(Q2 — adopted per recommendation.)*
-4. **yt-dlp-style extractor registry (chosen)** vs a single hardcoded URL switch (rejected: "future stores" was an explicit requirement; a switch is a merge-conflict magnet). Extractor = regex + extract method + priority, registered via `init()`.
-5. **Masterminds/semver v3 (chosen)** vs `golang.org/x/mod/semver` (rejected: constraint *checking* of forms like `^1.85.0 || ^1.86.0` is required for "patch only if needed"; x/mod only canonicalizes).
-6. **Unified `zen-vsix URL` CLI, local paths accepted by the direct extractor (chosen)** vs separate `download`/`patch` subcommands (rejected: user explicitly asked for `zen-vsix URL`; treating a local `.vsix` path as an already-downloaded artifact folds `patch.sh`'s use case into the same code path with zero extra surface).
+1. **Streaming raw-copy zip rewrite** vs full unzip/rezip (demonstrated `patch.sh`: recompresses ~22 MB, temp dir, ~3× IO) vs byte-level in-place surgery (rejected: `package.json` is Deflate-compressed — verified 89% — so same-size byte patch impossible without recompression shifting offsets). Raw copy = 1 read + 1 write pass, near-zero CPU; soundness independently verified against `archive/zip` source (bit-3 descriptor, zip64, name bytes).
+2. **Auto-detect exact fork version → `^1.107.0`** vs conservative floor like the example's `^1.100.0` (rejected: fork `product.json` provably reports `1.107.0`; the floor is a hand-picked constant and can mask genuinely-missing APIs). `force_engine_version`/`--engine-version` override. *(Q1 — adopted per recommendation.)*
+3. **Cut `patch_manifest` / `extension.vsixmanifest` rewriting from v1 (YAGNI)** vs carrying it (rejected by external red-team: proven `patch.sh` never touches it, no fork shown to require it). Cheaper to re-add when a fork demands it. *(Resolves earlier Q2 — superseded by this cut.)*
+4. **Explicit ordered-slice extractor registry** vs per-file `init()` + `Priority()` (rejected after red-team: priority bands are footguns, init-order is fragile). Simpler and still yt-dlp-shaped — appending to `all` is the extension recipe.
+5. **Masterminds/semver v3 with prerelease normalization** vs `golang.org/x/mod/semver` (rejected: constraint *checking* of `^1.85.0 \|\| ^1.86.0` is required; x/mod can't). Red-team caught that `Check` excludes prereleases — now handled by stripping the fork's prerelease.
+6. **Unified `zen-vsix URL` CLI, local paths handled by the direct extractor** vs separate `download`/`patch` subcommands (rejected: user asked for `zen-vsix URL`; a local `.vsix` path as "already-downloaded artifact" folds `patch.sh` into the same path with zero extra CLI).
+7. **Keep `VerifyPatched` + add external `unzip -t`** — red-team (correctly) recommended keeping the safety net given zip edge cases; strengthened with an independent parser.
+8. **Keep `-k/--keep-original` and `Overwrite` as separate flags** (red-team suggested merging into `--safe`; rejected — distinct semantics: preserve the unpatched original vs refuse to clobber an existing patched output; merging is vaguer, not simpler).
 
-## Red-team critique summary
+## Red-team critique summary (external browser.chat/claude via `zbrowser`, per chat-research skill)
 
-`browser.chat` (claude) was **not available** in this session (no browser tool/CLI installed). Substituted with a systematic internal adversarial review; each point dispositioned:
+Two rejections below were independently verified against the Go `archive/zip` source before dispositioning (chat-research's "verify before acting" step):
 
-| Point | Disposition |
+| Red-team point (severity) | Disposition |
 |---|---|
-| Marketplace API may rate-limit / require User-Agent | **folded in** — extractors send `User-Agent: zen-vsix/0.1`; typed `ErrBadStatus` |
-| Raw-copy may fail on data-descriptor entries | **folded in** — CD-based `FileHeader` copy + dedicated fixture test (step 10e) |
-| Pre-release fork versions (`1.107.0-insider`) | **folded in** — Masterminds canonicalizes; pre-release preserved |
-| 100 MB+ extensions must not load fully into memory | **folded in** — streaming download + raw copy; memory is O(manifest) |
-| Marketplace returns per-platform packages | **folded in** — prefer `targetPlatform=="universal"`/empty; `--platform` noted as future |
-| Constraint corner cases (`1.90.x`, `||`, ranges) | **folded in** — Masterminds + unit tests |
-| Windows paths / zip64 | **folded in** — `filepath`, archive/zip handles zip64 from copied headers |
-| `output_dir` portability | **folded in** — resolved relative to config.json, not CWD |
-| Patching ≠ API compatibility | **folded in** — README warning; accepted risk per user's stated goal |
-| Stale "latest" resolution | **folded in** — stateless, resolve per run (also keeps behavior deterministic) |
-| Corrupt zip after patch | **folded in** — mandatory `VerifyPatched` before rename |
-| `patch_manifest` semantics unknowable without fork internals | **folded in** — config option, default matches proven patch.sh |
+| Raw-copy + data-descriptor bit 3 → invalid trailing state (blocker) | **Rejected as blocker; folded defensively.** Source-verified that `fileWriter.close()` (raw path) calls `writeDataDescriptor()` using CD CRC/sizes → descriptor correctly emitted; `OpenRaw` returns payload only but the descriptor is re-emitted on close. Folded: value-copy `FileHeader` (CreateRaw mutates), `unzip -t` acceptance. |
+| Zip64 untested (blocker) | **Folded** — synthetic zip64 fixture added (step 10g). |
+| EFS bit-11 non-UTF8 name round-trip corruption (major) | **Rejected.** Source-verified reader stores raw name bytes + preserves `Flags` (line 405 computes a convenience `NonUTF8` bool, never rewrites header); raw copy is byte-identical. Guard would be wrong. |
+| Prerelease excluded by `Check` → wrong patch decision (blocker) | **Folded** — strip fork prerelease before `Check` (step 10 + test d). Real catch. |
+| Constraint syntax gaps (`1.90.x`, `>= <`, `||`, whitespace) untested (major) | **Folded** — test set e expanded. |
+| Unparseable-constraint behavior unspecified (minor) | **Folded** — warn + skip patch, keep original (non-destructive). |
+| `direct.go` `Version:"parsed-from-manifest-later"` is vague (minor) | **Folded** — explicit pipeline backfill of Name/Publisher/Version from Manifest (step 13). |
+| Marketplace empty result → index panic (major) | **Folded** — `ErrNotFound` guard (step 8). |
+| Filename collision is check-then-act TOCTOU + concurrency (major) | **Folded** — `flock` on `out/.lock` + atomic rename under lock (step 13). |
+| `-o` vs config `output_dir` precedence unspecified (minor) | **Folded** — CLI wins (step 13). |
+| HTTP timeout unspecified → CLI hangs (major) | **Folded** — 60 s ctx in `main.go` (step 14). |
+| 429 rate-limit no retry story (major) | **Folded** — bounded 2× retry honoring `Retry-After` (downloader). |
+| `Extension/package.json` case-variant unhandled (major) | **Folded** — case-insensitive fallback + near-miss error (manifest). |
+| `product.json` empty-version vs missing conflated (minor) | **Folded** — distinct errors in `DetectEngineVersion` (step 3). |
+| No-publisher field for direct URLs (minor) | **Folded** — output name falls back to basename; fields nullable. |
+| `output_dir` no-permission error not surfaced (minor) | **Folded** — named permission error in pipeline. |
+| Cut `patch_manifest` from v1 (YAGNI) | **Folded** — removed config field, patcher branch, decision #3. |
+| Merge `KeepOriginal`/`Overwrite` into `--safe` | **Rejected** — distinct semantics (decision #8). |
+| Priority magic numbers are a footgun (refinement) | **Folded** — replaced with explicit ordered slice in `registry.go` (decision #4). |
+| Keep `VerifyPatched` as the safety net | **Folded** — kept + strengthened with external `unzip -t`. |
 
 ## Open questions
 
-- **None blocking.** Two items were asked and implicitly deferred to my judgment, both reversible via config: (1) patch target = exact auto-detected fork version (`^1.107.0`) — override with `force_engine_version`; (2) manifest patching off by default — enable with `"patch_manifest": true`. Both are documented as decisions above rather than blocking questions.
-- **Future scope, explicitly not blocking:** priority order for the next extractors (GitHub Releases is the natural third), and explicit `--platform` selection for native extensions on the Marketplace extractor.
+- **None blocking.** The two red-team "blockers" marked rejected above were resolved by source verification, not left as open questions.
+- **Deferred by user (adopted defaults, reversible):** Q1 engine-target = auto-detected `^1.107.0` (override via config/flag); the earlier Q2 (manifest patching) is now moot — cut from v1 per red-team YAGNI and re-addable if a fork requires it.
+- **Future scope, explicitly not blocking:** priority/order for next extractors (GitHub Releases is natural third), and `--platform` selection for native extensions on the Marketplace extractor.
