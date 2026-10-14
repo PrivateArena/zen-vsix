@@ -25,7 +25,11 @@ Requires Go 1.23+. The only dependency is `github.com/Masterminds/semver/v3`.
 ## Usage
 
 ```sh
-zen-vsix <URL-or-local.vsix> [-c config.json] [--engine-version X] [-o out] [-k] [--no-patch]
+zen-vsix <URL-or-local.vsix> [--engine-version X] [-o out] [-k] [--no-patch]
+
+# config.json is picked up automatically; -c is only needed for a non-standard
+# location:
+zen-vsix /path/to/ext.vsix -c /somewhere/else/config.json
 ```
 
 Inputs:
@@ -40,7 +44,7 @@ Flags:
 
 | Flag | Meaning |
 |------|---------|
-| `-c`, `-config` | path to `config.json` (optional; defaults apply if absent) |
+| `-c`, `-config` | path to `config.json`; when omitted the file is auto-discovered (see below) |
 | `--engine-version` | override the fork engine version (highest precedence) |
 | `-o` | output dir (wins over config `output_dir`) |
 | `-k`, `-keep-original` | also keep the pristine download next to the patched output |
@@ -73,6 +77,18 @@ Engine resolution precedence: `--engine-version` flag > config `force_engine_ver
 > auto-detect from `resources/app/product.json` (falling back to
 `resources/app/package.json`, `product.json`, `package.json`). No file found, and
 no override → clear error pointing at the escape hatches.
+
+### Where `config.json` is found
+
+Without `-c`, the first existing file among these is loaded:
+
+1. `$ZEN_VSIX_CONFIG` (if set, it must point at a readable file)
+2. `./config.json` — the directory you ran `zen-vsix` from
+3. `<dir of the zen-vsix binary>/config.json`
+4. `<user config dir>/zen-vsix/config.json` — e.g. `~/.config/zen-vsix/config.json`
+
+If none exists, built-in defaults apply (no `vscode_path`, `output_dir` = `out`
+relative to the working directory). `-c` with an unreadable path is an error.
 
 ## Adding a store (yt-dlp-style extension point)
 

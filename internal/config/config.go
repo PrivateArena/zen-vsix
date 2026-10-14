@@ -1,6 +1,7 @@
 // Package config loads the user-owned zen-vsix configuration file.
 //
-// The config file is optional: a missing file yields the defaults. All
+// The config file is optional: an empty path (nothing discovered) or a missing
+// file yields the defaults — see Discover for how a path is auto-selected. All
 // relative paths inside the file (currently output_dir) are resolved
 // relative to the directory containing config.json, NOT the current working
 // directory, so the tool behaves identically regardless of where it is
@@ -48,6 +49,9 @@ func Default() *Config {
 // be silently ignored, as the user's output_dir/overwrite intent would be
 // lost.
 func Load(path string) (*Config, error) {
+	if path == "" {
+		return Default(), nil
+	}
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return Default(), nil

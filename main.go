@@ -6,6 +6,10 @@
 // Usage:
 //
 //	zen-vsix <URL-or-local.vsix> [-c config.json] [--engine-version X] [-o out] [-k] [--no-patch]
+//
+// Without -c the config file is auto-discovered: $ZEN_VSIX_CONFIG, then
+// config.json in the working directory, next to the executable, or in the
+// user config directory.
 package main
 
 import (
@@ -18,6 +22,7 @@ import (
 	"time"
 
 	"zen-vsix/internal/app"
+	"zen-vsix/internal/config"
 	"zen-vsix/internal/extract"
 )
 
@@ -29,8 +34,8 @@ func main() {
 
 func run(args []string) int {
 	fs := flag.NewFlagSet("zen-vsix", flag.ExitOnError)
-	configPath := fs.String("c", "", "path to config.json (optional)")
-	fs.StringVar(configPath, "config", "", "path to config.json (optional)")
+	configPath := fs.String("c", "", "path to config.json (default: auto-discovered)")
+	fs.StringVar(configPath, "config", "", "path to config.json (default: auto-discovered)")
 	engine := fs.String("engine-version", "", "override fork engine version (highest precedence)")
 	outputDir := fs.String("o", "", "output directory (wins over config output_dir)")
 	keep := fs.Bool("k", false, "keep the pristine download next to the patched output")
@@ -57,11 +62,17 @@ func run(args []string) int {
 	}
 	rawURL := positional[0]
 
+	cfgPath, err := resolveConfigPath(*configPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "zen-vsix: %v\n", err)
+		return 1
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
 	res, err := app.Run(ctx, rawURL, app.Options{
-		ConfigPath:        *configPath,
+		ConfigPath:        cfgPath,
 		EngineOverride:    *engine,
 		OutputDirOverride: *outputDir,
 		KeepOriginal:      *keep,
@@ -77,6 +88,20 @@ func run(args []string) int {
 	}
 	printSummary(res)
 	return 0
+}
+
+// resolveConfigPath applies the config precedence: -c/-config wins and must
+// point at a readable file; otherwise the file is auto-discovered ($ZEN_VSIX_CONFIG,
+// ./config.json, config.json next to the binary, <user config>/zen-vsix/config.json).
+// An empty result means "no config file" and the pipeline uses its defaults.
+func resolveConfigPath(flagPath string) (string, error) {
+	if flagPath == "" {
+		return config.Discover()
+	}
+	if err := config.ValidatePath(flagPath); err != nil {
+		return "", err
+	}
+	return flagPath, nil
 }
 
 // splitPositional separates the single positional argument from flags, working
@@ -127,6 +152,9 @@ Flags:
 	fs.SetOutput(os.Stderr)
 	fs.PrintDefaults()
 	fmt.Fprint(os.Stderr, `
+Without -c, config.json is loaded automatically when found in the current
+directory, next to the zen-vsix binary, or at $ZEN_VSIX_CONFIG.
+
 When the extension requires a newer engine than the fork, only
 extension/package.json is rewritten (engines.vscode = ^<fork-version>);
 every other entry is copied byte-for-byte. Otherwise the artifact is kept.
